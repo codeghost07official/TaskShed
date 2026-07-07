@@ -3,6 +3,8 @@ from flask import Flask, redirect, url_for, session, render_template, request, j
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
+
 from authlib.integrations.flask_client import OAuth
 
 # Load environment variables from .env
@@ -10,6 +12,10 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY")
+
+# Initialize Global Database Connection Pool (Min 1 connection, Max 20 connections)
+# Keeps connections open and active to eliminate the 5-second handshake lag
+db_pool = ThreadedConnectionPool(1, 20, os.getenv('DATABASE_URL'))
 
 # Configure Google OAuth
 oauth = OAuth(app)
@@ -20,10 +26,6 @@ google = oauth.register(
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
     client_kwargs={'scope': 'openid email profile'}
 )
-
-# Database Helper
-def get_db_connection():
-    return psycopg2.connect(os.getenv('DATABASE_URL'))
 
 # --- AUTHENTICATION ROUTES ---
 
@@ -48,17 +50,20 @@ def auth_callback():
         email = user_info['email']
         name = user_info.get('name', '')
 
-        # Upsert user into database (Insert if new, leave alone if existing)
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO users (google_id, email, name)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (google_id) DO NOTHING;
-        """, (google_id, email, name))
-        conn.commit()
-        cur.close()
-        conn.close()
+        # Grab a connection from the persistent pool
+        conn = db_pool.getconn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO users (google_id, email, name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (google_id) DO NOTHING;
+            """, (google_id, email, name))
+            conn.commit()
+            cur.close()
+        finally:
+            # Safely release the connection back to the pool instead of closing it
+            db_pool.putconn(conn)
 
         # Store critical user info in session
         session['user'] = {
@@ -81,13 +86,14 @@ def dashboard():
     if 'user' not in session:
         return redirect(url_for('index'))
     
-    # Fetch user configuration details for UI customization
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM users WHERE google_id = %s", (session['user']['google_id'],))
-    user_settings = cur.fetchone()
-    cur.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM users WHERE google_id = %s", (session['user']['google_id'],))
+        user_settings = cur.fetchone()
+        cur.close()
+    finally:
+        db_pool.putconn(conn)
     
     return render_template('dashboard.html', user=user_settings)
 
@@ -106,17 +112,20 @@ def get_tasks():
     if not date_str:
         return jsonify({'error': 'Date parameters missing'}), 400
         
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("""
-        SELECT id, title, is_completed 
-        FROM tasks 
-        WHERE google_id = %s AND task_date = %s 
-        ORDER BY id ASC
-    """, (session['user']['google_id'], date_str))
-    tasks = cur.fetchall()
-    cur.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT id, title, is_completed 
+            FROM tasks 
+            WHERE google_id = %s AND task_date = %s 
+            ORDER BY id ASC
+        """, (session['user']['google_id'], date_str))
+        tasks = cur.fetchall()
+        cur.close()
+    finally:
+        db_pool.putconn(conn)
+        
     return jsonify(tasks)
 
 @app.route('/api/tasks', methods=['POST'])
@@ -125,17 +134,20 @@ def add_task():
         return jsonify({'error': 'Unauthorized'}), 401
         
     data = request.json
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("""
-        INSERT INTO tasks (google_id, task_date, title) 
-        VALUES (%s, %s, %s) 
-        RETURNING id, title, is_completed
-    """, (session['user']['google_id'], data['date'], data['title']))
-    new_task = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            INSERT INTO tasks (google_id, task_date, title) 
+            VALUES (%s, %s, %s) 
+            RETURNING id, title, is_completed
+        """, (session['user']['google_id'], data['date'], data['title']))
+        new_task = cur.fetchone()
+        conn.commit()
+        cur.close()
+    finally:
+        db_pool.putconn(conn)
+        
     return jsonify(new_task)
 
 @app.route('/api/tasks/<int:task_id>/toggle', methods=['POST'])
@@ -143,16 +155,19 @@ def toggle_task(task_id):
     if 'user' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
         
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE tasks 
-        SET is_completed = NOT is_completed 
-        WHERE id = %s AND google_id = %s
-    """, (task_id, session['user']['google_id']))
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE tasks 
+            SET is_completed = NOT is_completed 
+            WHERE id = %s AND google_id = %s
+        """, (task_id, session['user']['google_id']))
+        conn.commit()
+        cur.close()
+    finally:
+        db_pool.putconn(conn)
+        
     return jsonify({'success': True})
 
 @app.route('/api/tasks/<int:task_id>/edit', methods=['POST'])
@@ -161,16 +176,19 @@ def edit_task(task_id):
         return jsonify({'error': 'Unauthorized'}), 401
         
     data = request.json
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE tasks 
-        SET title = %s 
-        WHERE id = %s AND google_id = %s
-    """, (data['title'], task_id, session['user']['google_id']))
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE tasks 
+            SET title = %s 
+            WHERE id = %s AND google_id = %s
+        """, (data['title'], task_id, session['user']['google_id']))
+        conn.commit()
+        cur.close()
+    finally:
+        db_pool.putconn(conn)
+        
     return jsonify({'success': True})
 
 @app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
@@ -178,12 +196,15 @@ def delete_task(task_id):
     if 'user' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
         
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM tasks WHERE id = %s AND google_id = %s", (task_id, session['user']['google_id']))
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM tasks WHERE id = %s AND google_id = %s", (task_id, session['user']['google_id']))
+        conn.commit()
+        cur.close()
+    finally:
+        db_pool.putconn(conn)
+        
     return jsonify({'success': True})
 
 # --- CONFIGURATION API ENDPOINTS ---
@@ -194,16 +215,19 @@ def save_pomodoro():
         return jsonify({'error': 'Unauthorized'}), 401
         
     data = request.json
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE users 
-        SET pomodoro_work = %s, pomodoro_break = %s 
-        WHERE google_id = %s
-    """, (data['work'], data['break'], session['user']['google_id']))
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE users 
+            SET pomodoro_work = %s, pomodoro_break = %s 
+            WHERE google_id = %s
+        """, (data['work'], data['break'], session['user']['google_id']))
+        conn.commit()
+        cur.close()
+    finally:
+        db_pool.putconn(conn)
+        
     return jsonify({'success': True})
 
 @app.route('/api/settings/theme', methods=['POST'])
@@ -212,18 +236,17 @@ def toggle_theme():
         return jsonify({'error': 'Unauthorized'}), 401
         
     data = request.json
-    new_theme = data['theme'] # 'light' or 'dark'
+    new_theme = data['theme']
     
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET theme = %s WHERE google_id = %s", (new_theme, session['user']['google_id']))
-    
-    # Per instructions, switching themes automatically wipes user tasks from the database
-    cur.execute("DELETE FROM tasks WHERE google_id = %s", (session['user']['google_id'],))
-    
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET theme = %s WHERE google_id = %s", (new_theme, session['user']['google_id']))
+        conn.commit()
+        cur.close()
+    finally:
+        db_pool.putconn(conn)
+        
     return jsonify({'success': True})
 
 @app.route('/api/settings/clear', methods=['POST'])
@@ -231,12 +254,15 @@ def clear_all_tasks():
     if 'user' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
         
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM tasks WHERE google_id = %s", (session['user']['google_id'],))
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM tasks WHERE google_id = %s", (session['user']['google_id'],))
+        conn.commit()
+        cur.close()
+    finally:
+        db_pool.putconn(conn)
+        
     return jsonify({'success': True})
 
 if __name__ == '__main__':

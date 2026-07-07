@@ -47,23 +47,23 @@ document.addEventListener('DOMContentLoaded', () => {
     function renderTasks(tasks) {
         taskList.innerHTML = '';
         if (tasks.length === 0) {
-            taskList.innerHTML = `<li class="text-sm text-slate-400 text-center py-4">No objectives set for this date.</li>`;
+            taskList.innerHTML = `<li class="text-sm text-slate-400 dark:text-slate-500 text-center py-4 animate-fade-in">No objectives set for this date.</li>`;
             return;
         }
+
         tasks.forEach(task => {
             const li = document.createElement('li');
-            li.className = `flex items-center justify-between p-3 border rounded-xl bg-white shadow-sm transition-all ${
-                document.body.classList.contains('dark-mode') ? 'bg-slate-800/60 border-slate-700' : 'border-slate-100'
-            }`;
+            li.className = "flex items-center justify-between p-3 border border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-800/40 rounded-xl shadow-sm text-slate-900 dark:text-white transition-all";
+            li.setAttribute('data-id', task.id);
 
             li.innerHTML = `
-                <div class="flex items-center gap-3 flex-1">
-                    <input type="checkbox" ${task.is_completed ? 'checked' : ''} class="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500 cursor-pointer" data-id="${task.id}">
-                    <span class="text-sm font-medium task-title-text ${task.is_completed ? 'line-through text-slate-400' : ''}" data-id="${task.id}">${task.title}</span>
+                <div class="flex items-center gap-3 flex-1 task-view-container">
+                    <input type="checkbox" ${task.is_completed ? 'checked' : ''} class="task-checkbox w-4 h-4 text-blue-600 rounded border-slate-300 dark:border-slate-600 focus:ring-blue-500 cursor-pointer bg-transparent" data-id="${task.id}">
+                    <span class="text-sm font-medium task-title-text ${task.is_completed ? 'line-through text-slate-400 dark:text-slate-500' : ''}" data-id="${task.id}">${task.title}</span>
                 </div>
-                <div class="flex items-center gap-2">
-                    <button class="edit-btn text-xs text-blue-500 hover:underline" data-id="${task.id}">Edit</button>
-                    <button class="delete-btn text-xs text-red-500 hover:underline" data-id="${task.id}">Delete</button>
+                <div class="flex items-center gap-2 task-actions-container">
+                    <button class="edit-btn text-xs text-blue-500 dark:text-blue-400 hover:underline" data-id="${task.id}">Edit</button>
+                    <button class="delete-btn text-xs text-red-500 dark:text-red-400 hover:underline" data-id="${task.id}">Delete</button>
                 </div>
             `;
             taskList.appendChild(li);
@@ -76,14 +76,36 @@ document.addEventListener('DOMContentLoaded', () => {
         const title = taskInput.value.trim();
         if (!title) return;
 
+        // Optimistic UX: Create a temporary visual element instantly
+        const tempId = Date.now();
+        const li = document.createElement('li');
+        li.className = "flex items-center justify-between p-3 border border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-800/40 rounded-xl shadow-sm text-slate-900 dark:text-white opacity-60";
+        li.setAttribute('data-id', tempId);
+        li.innerHTML = `
+            <div class="flex items-center gap-3 flex-1">
+                <input type="checkbox" disabled class="w-4 h-4 rounded border-slate-300 dark:border-slate-600 bg-transparent">
+                <span class="text-sm font-medium">${title}</span>
+            </div>
+            <div class="text-xs text-slate-400">Saving...</div>
+        `;
+        
+        // Remove empty state if present
+        if (taskList.querySelector('li')?.classList.contains('text-slate-400')) {
+            taskList.innerHTML = '';
+        }
+        taskList.appendChild(li);
+        taskInput.value = '';
+
         const res = await fetch('/api/tasks', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ date: dateInput.value, title })
         });
+        
         if (res.ok) {
-            taskInput.value = '';
-            fetchTasks();
+            fetchTasks(); // Sync layout cleanly with real database IDs
+        } else {
+            li.remove(); // Rollback on connection failure
         }
     });
 
@@ -92,33 +114,94 @@ document.addEventListener('DOMContentLoaded', () => {
         const id = e.target.dataset.id;
         if (!id) return;
 
-        if (e.target.type === 'checkbox') {
-            await fetch(`/api/tasks/${id}/toggle`, { method: 'POST' });
-            fetchTasks();
-        } else if (e.target.classList.contains('delete-btn')) {
-            await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
-            fetchTasks();
-        } else if (e.target.classList.contains('edit-btn')) {
-            const span = taskList.querySelector(`span[data-id="${id}"]`);
-            const currentTitle = span.textContent;
-            const newTitle = prompt("Modify objective title:", currentTitle);
-            if (newTitle && newTitle.trim() !== currentTitle) {
-                await fetch(`/api/tasks/${id}/edit`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ title: newTitle.trim() })
-                });
-                fetchTasks();
+        const li = e.target.closest('li');
+
+        // 1. Toggle Checkbox (Optimistic Update)
+        if (e.target.classList.contains('task-checkbox')) {
+            const span = li.querySelector('.task-title-text');
+            const isChecked = e.target.checked;
+            
+            // Instantly toggle styles without waiting for network response
+            if (isChecked) {
+                span.classList.add('line-through', 'text-slate-400', 'dark:text-slate-500');
+            } else {
+                span.classList.remove('line-through', 'text-slate-400', 'dark:text-slate-500');
             }
+
+            const res = await fetch(`/api/tasks/${id}/toggle`, { method: 'POST' });
+            if (!res.ok) {
+                // Rollback on network failure
+                e.target.checked = !isChecked;
+                span.classList.toggle('line-through');
+            }
+        } 
+        // 2. Delete Task (Optimistic Update)
+        else if (e.target.classList.contains('delete-btn')) {
+            // Instantly wipe row from screen layout dynamically
+            li.style.display = 'none'; 
+
+            const res = await fetch(`/api/tasks/${id}`, { method: 'DELETE' });
+            if (res.ok) {
+                li.remove();
+                if (taskList.children.length === 0) {
+                    taskList.innerHTML = `<li class="text-sm text-slate-400 dark:text-slate-500 text-center py-4">No objectives set for this date.</li>`;
+                }
+            } else {
+                li.style.display = 'flex'; // Rollback on failure
+            }
+        } 
+        // 3. Inline Edit Mode trigger (Instant local transition)
+        else if (e.target.classList.contains('edit-btn')) {
+            const viewContainer = li.querySelector('.task-view-container');
+            const actionsContainer = li.querySelector('.task-actions-container');
+            const currentTitle = viewContainer.querySelector('.task-title-text').textContent;
+
+            viewContainer.innerHTML = `
+                <input type="text" class="inline-edit-input w-full text-sm font-medium border border-blue-500 dark:border-blue-400 rounded-lg px-2 py-1 focus:outline-none bg-white dark:bg-slate-800 text-slate-950 dark:text-white" value="${currentTitle}">
+            `;
+            actionsContainer.innerHTML = `
+                <button class="save-inline-btn text-xs text-emerald-500 dark:text-emerald-400 font-bold hover:underline" data-id="${id}">Save</button>
+                <button class="cancel-inline-btn text-xs text-slate-400 dark:text-slate-500 hover:underline" data-id="${id}">Cancel</button>
+            `;
+            
+            viewContainer.querySelector('.inline-edit-input').focus();
+        }
+        // 4. Save Inline Edited Task (Optimistic Update)
+        else if (e.target.classList.contains('save-inline-btn')) {
+            const newTitle = li.querySelector('.inline-edit-input').value.trim();
+            if (!newTitle) return;
+
+            // Instantly transition UI back to static view with new text values
+            li.innerHTML = `
+                <div class="flex items-center gap-3 flex-1 task-view-container">
+                    <input type="checkbox" class="task-checkbox w-4 h-4 text-blue-600 rounded border-slate-300 dark:border-slate-600 focus:ring-blue-500 cursor-pointer bg-transparent" data-id="${id}">
+                    <span class="text-sm font-medium task-title-text" data-id="${id}">${newTitle}</span>
+                </div>
+                <div class="flex items-center gap-2 task-actions-container">
+                    <button class="edit-btn text-xs text-blue-500 dark:text-blue-400 hover:underline" data-id="${id}">Edit</button>
+                    <button class="delete-btn text-xs text-red-500 dark:text-red-400 hover:underline" data-id="${id}">Delete</button>
+                </div>
+            `;
+
+            const res = await fetch(`/api/tasks/${id}/edit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title: newTitle })
+            });
+            if (!res.ok) {
+                fetchTasks(); // Rollback to original db records on failure
+            }
+        }
+        // 5. Cancel Inline Editing
+        else if (e.target.classList.contains('cancel-inline-btn')) {
+            fetchTasks();
         }
     });
 
-    // Wipe layout configuration
+    // Clear all tasks instantly (Optimistic)
     clearAllBtn.addEventListener('click', async () => {
-        if (confirm("Are you sure you want to clear all tasks from database storage?")) {
-            await fetch('/api/settings/clear', { method: 'POST' });
-            fetchTasks();
-        }
+        taskList.innerHTML = `<li class="text-sm text-slate-400 dark:text-slate-500 text-center py-4">No objectives set for this date.</li>`;
+        await fetch('/api/settings/clear', { method: 'POST' });
     });
 
     dateInput.addEventListener('change', fetchTasks);
@@ -144,18 +227,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 clearInterval(countdownInterval);
                 isRunning = false;
                 
-                // Fire notification bell sound
-                try { bellAudio.play(); } catch(e) { console.log("Audio notification blocked by browser."); }
+                try { bellAudio.play(); } catch(e) { console.log("Audio notification blocked."); }
                 
-                // Flip operational mode
                 isWorkSession = !isWorkSession;
                 if (isWorkSession) {
                     timerStatus.textContent = "Work Session";
-                    timerStatus.className = "text-xs font-bold uppercase tracking-widest text-blue-600 bg-blue-50 px-3 py-1 rounded-full mb-6";
+                    timerStatus.className = "text-xs font-bold uppercase tracking-widest text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/30 px-3 py-1 rounded-full mb-6";
                     timeLeft = parseInt(workInput.value) * 60;
                 } else {
                     timerStatus.textContent = "Break Session";
-                    timerStatus.className = "text-xs font-bold uppercase tracking-widest text-emerald-600 bg-emerald-50 px-3 py-1 rounded-full mb-6";
+                    timerStatus.className = "text-xs font-bold uppercase tracking-widest text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/30 px-3 py-1 rounded-full mb-6";
                     timeLeft = parseInt(breakInput.value) * 60;
                 }
                 startBtn.classList.remove('hidden');
@@ -176,7 +257,7 @@ document.addEventListener('DOMContentLoaded', () => {
         pauseTimer();
         isWorkSession = true;
         timerStatus.textContent = "Work Session";
-        timerStatus.className = "text-xs font-bold uppercase tracking-widest text-blue-600 bg-blue-50 px-3 py-1 rounded-full mb-6";
+        timerStatus.className = "text-xs font-bold uppercase tracking-widest text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/30 px-3 py-1 rounded-full mb-6";
         timeLeft = parseInt(workInput.value) * 60;
         updateTimerDisplay();
     }
@@ -188,44 +269,38 @@ document.addEventListener('DOMContentLoaded', () => {
     saveSettingsBtn.addEventListener('click', async () => {
         const work = parseInt(workInput.value);
         const brk = parseInt(breakInput.value);
-        const res = await fetch('/api/settings/pomodoro', {
+        
+        // Instant visual reset feedback
+        resetTimer();
+
+        await fetch('/api/settings/pomodoro', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ work, break: brk })
         });
-        if (res.ok) {
-            alert("Timer parameters applied successfully!");
-            resetTimer();
-        }
     });
 
     // --- THEME MUTATION ENGINE ---
     themeToggleBtn.addEventListener('click', async () => {
-        const isDark = document.body.classList.contains('dark-mode');
-        const newTheme = isDark ? 'light' : 'dark';
+        const isCurrentlyDark = document.documentElement.classList.contains('dark');
+        const newTheme = isCurrentlyDark ? 'light' : 'dark';
 
-        if (confirm("Warning: Changing themes will clear all tasks per structure initialization instructions. Continue?")) {
-            const res = await fetch('/api/settings/theme', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ theme: newTheme })
-            });
-
-            if (res.ok) {
-                if (newTheme === 'dark') {
-                    document.body.classList.add('dark-mode', 'bg-slate-900', 'text-slate-100');
-                    document.body.classList.remove('bg-slate-50', 'text-slate-900');
-                    themeToggleBtn.className = "p-2 bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors";
-                    themeIcon.textContent = "☀️ Light Mode";
-                } else {
-                    document.body.classList.remove('dark-mode', 'bg-slate-900', 'text-slate-100');
-                    document.body.classList.add('bg-slate-50', 'text-slate-900');
-                    themeToggleBtn.className = "p-2 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors";
-                    themeIcon.textContent = "🌙 Dark Mode";
-                }
-                fetchTasks(); // Refresh board layout matrix status
-            }
+        // Optimistic Theme Swapping (flips visually instantly)
+        if (newTheme === 'dark') {
+            document.documentElement.classList.add('dark');
+            themeToggleBtn.className = "p-2 bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors text-white";
+            themeIcon.textContent = "☀️ Light Mode";
+        } else {
+            document.documentElement.classList.remove('dark');
+            themeToggleBtn.className = "p-2 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors text-slate-700";
+            themeIcon.textContent = "🌙 Dark Mode";
         }
+
+        await fetch('/api/settings/theme', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ theme: newTheme })
+        });
     });
 
     // Kickstart application state engine
